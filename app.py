@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import yfinance as yf
 
 # --- PAGE SETUP ---
@@ -15,10 +17,8 @@ st.sidebar.divider()
 # ==========================================
 # THE AUTONOMOUS YAHOO FINANCE ENGINE
 # ==========================================
-@st.cache_data(ttl=3600) # Refreshes every hour
+@st.cache_data(ttl=3600) 
 def fetch_market_data():
-    # 1. LOAD STATIC MASTER LIST FROM GOOGLE SHEETS
-    # UPDATED WITH YOUR NEW GOOGLE SHEETS EXPORT URL
     sheet_url = "https://docs.google.com/spreadsheets/d/1jTpv3fahEDxpgvc1Xg3kJ74ZMUhWh6Goq9kWeFHNqIg/export?format=csv"
     
     try:
@@ -35,8 +35,6 @@ def fetch_market_data():
     if not tickers:
         raise ValueError("No tickers found in the Google Sheet.")
 
-    # 2. BULK DOWNLOAD FROM YAHOO FINANCE
-    # We pull 3 months of data to satisfy the 50-day volume baseline
     raw_data = yf.download(tickers, period="3mo", group_by='ticker', threads=True)
     
     all_stocks = []
@@ -46,7 +44,6 @@ def fetch_market_data():
             if len(tickers) == 1:
                 stock_df = raw_data.copy()
             else:
-                # Bypass tickers that failed to download
                 if ticker not in raw_data.columns.levels[0]: 
                     continue
                 stock_df = raw_data[ticker].copy()
@@ -58,7 +55,6 @@ def fetch_market_data():
             stock_df = stock_df.reset_index()
             stock_df['Symbol'] = ticker
             
-            # Strip timezone to prevent Streamlit/Plotly errors
             if 'Date' in stock_df.columns:
                 stock_df['Date'] = pd.to_datetime(stock_df['Date']).dt.tz_localize(None)
             
@@ -70,8 +66,6 @@ def fetch_market_data():
         raise ValueError("Failed to download price data for the provided symbols from Yahoo Finance.")
         
     final_price_df = pd.concat(all_stocks, ignore_index=True)
-    
-    # 3. MERGE PRICES WITH SECTOR/INDUSTRY DATA
     merged_df = pd.merge(final_price_df, master_list, on='Symbol', how='left')
     
     return merged_df
@@ -237,6 +231,97 @@ if page == "Scanner Dashboard":
                 st.dataframe(strong_stocks, use_container_width=True)
             else:
                 st.warning(f"No stocks in {selected_group} have enough historical data.")
+
+        st.divider()
+
+        # ==========================================
+        # NEW PHASE 4: INDIVIDUAL TICKER DEEP DIVE
+        # ==========================================
+        st.header("Phase 4: Ticker Deep Dive (10-Day Chart)")
+        st.markdown("Enter a specific ticker symbol to view its latest 10-day trends.")
+
+        deep_dive_ticker = st.text_input("Enter Ticker Symbol (e.g., SHOP.TO, RY.TO):", "").strip().upper()
+
+        if deep_dive_ticker:
+            if deep_dive_ticker not in df['Symbol'].values:
+                st.error(f"Ticker '{deep_dive_ticker}' not found in the dataset.")
+            else:
+                with st.spinner(f"Generating 10-day chart for {deep_dive_ticker}..."):
+                    t_df = df[df['Symbol'] == deep_dive_ticker].sort_values('Date').copy()
+                    
+                    grp = t_df[grouping_level].iloc[0]
+                    t_df = pd.merge(t_df, group_df[group_df[grouping_level] == grp][['Date', 'Close']], on='Date', suffixes=('', '_Group'))
+                    
+                    t_df['RS'] = t_df['Close'] / t_df['Close_Group']
+                    t_df['RS_MA'] = t_df['RS'].rolling(window=rs_window).mean()
+                    t_df['Vol_Baseline'] = t_df['Volume'].rolling(window=vol_window).mean()
+                    
+                    if has_ohlc:
+                        t_df['Range'] = t_df['High'] - t_df['Low']
+                        t_df['CLV'] = np.where(t_df['Range'] > 0, ((t_df['Close'] - t_df['Low']) - (t_df['High'] - t_df['Close'])) / t_df['Range'], 0)
+                        
+                        t_df['Green_Vol'] = np.where(t_df['Close'] > t_df['Open'], t_df['Volume'], 0)
+                        t_df['Red_Vol'] = np.where(t_df['Close'] < t_df['Open'], t_df['Volume'], 0)
+                        t_df['Green_Vol_10D'] = t_df['Green_Vol'].rolling(window=10).sum()
+                        t_df['Red_Vol_10D'] = t_df['Red_Vol'].rolling(window=10).sum()
+                        t_df['Vol_Flow_Ratio'] = np.where(t_df['Red_Vol_10D'] > 0, t_df['Green_Vol_10D'] / t_df['Red_Vol_10D'], np.nan)
+                    
+                    # Get the last 10 days
+                    chart_df = t_df.tail(10).copy()
+                    
+                    if chart_df.empty:
+                         st.warning(f"Not enough data to plot {deep_dive_ticker}.")
+                    else:
+                        # Create Plotly Subplots
+                        fig = make_subplots(
+                            rows=5, cols=1, 
+                            shared_xaxes=True, 
+                            vertical_spacing=0.05,
+                            subplot_titles=(
+                                "Close Price", 
+                                f"Relative Strength (vs {grouping_level})", 
+                                "Volume & Breakout Level", 
+                                "Daily Control (CLV)", 
+                                "10-Day Volume Flow Ratio"
+                            )
+                        )
+
+                        # Row 1: Close Price
+                        fig.add_trace(go.Scatter(x=chart_df['Date'], y=chart_df['Close'], mode='lines+markers', name='Close Price', line=dict(color='blue')), row=1, col=1)
+
+                        # Row 2: Relative Strength
+                        fig.add_trace(go.Scatter(x=chart_df['Date'], y=chart_df['RS'], mode='lines+markers', name='RS', line=dict(color='purple')), row=2, col=1)
+                        fig.add_trace(go.Scatter(x=chart_df['Date'], y=chart_df['RS_MA'], mode='lines', name=f'{rs_window}-Day RS MA', line=dict(color='orange', dash='dash')), row=2, col=1)
+
+                        # Row 3: Volume and Breakout Threshold
+                        # Color volume bars green if Close > Open, else red
+                        vol_colors = ['green' if (has_ohlc and row['Close'] > row['Open']) else 'red' for _, row in chart_df.iterrows()]
+                        fig.add_trace(go.Bar(x=chart_df['Date'], y=chart_df['Volume'], name='Volume', marker_color=vol_colors), row=3, col=1)
+                        
+                        # Add the 1.5x breakout threshold line
+                        breakout_level = chart_df['Vol_Baseline'] * 1.5
+                        fig.add_trace(go.Scatter(x=chart_df['Date'], y=breakout_level, mode='lines', name='Breakout Threshold (1.5x)', line=dict(color='red', dash='dot')), row=3, col=1)
+
+                        # Row 4: CLV
+                        if has_ohlc:
+                            clv_colors = ['green' if val > 0.5 else 'red' if val < -0.5 else 'gray' for val in chart_df['CLV']]
+                            fig.add_trace(go.Bar(x=chart_df['Date'], y=chart_df['CLV'], name='CLV', marker_color=clv_colors), row=4, col=1)
+                            # Add reference lines for extreme buying (+0.5) and extreme selling (-0.5)
+                            fig.add_hline(y=0.5, line_dash="dash", line_color="green", row=4, col=1)
+                            fig.add_hline(y=-0.5, line_dash="dash", line_color="red", row=4, col=1)
+
+                        # Row 5: Volume Flow Ratio
+                        if has_ohlc:
+                             # Fill NaN with 0 for plotting purposes if needed, though they shouldn't exist if data is clean
+                             chart_df['Vol_Flow_Ratio'] = chart_df['Vol_Flow_Ratio'].fillna(0)
+                             flow_colors = ['green' if val > 1 else 'red' for val in chart_df['Vol_Flow_Ratio']]
+                             fig.add_trace(go.Bar(x=chart_df['Date'], y=chart_df['Vol_Flow_Ratio'], name='Vol Flow Ratio', marker_color=flow_colors), row=5, col=1)
+                             fig.add_hline(y=1.0, line_dash="dash", line_color="gray", row=5, col=1)
+
+                        fig.update_layout(height=1000, showlegend=False, title_text=f"10-Day Technical Analysis for {deep_dive_ticker}")
+                        fig.update_xaxes(type='category') # Ensures weekends are skipped in the chart
+                        
+                        st.plotly_chart(fig, use_container_width=True)
 
 # ==========================================
 # PAGE 2: MARKET HEATMAP
